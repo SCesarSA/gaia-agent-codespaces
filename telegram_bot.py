@@ -452,7 +452,6 @@ class TelegramGaiaBot:
                 model=model_id,
                 api_key=api_key,
                 messages=messages,
-                temperature=0.2,
                 max_tokens=700,
                 drop_params=True,
             )

@@ -122,6 +122,13 @@ produzir uma resposta, receber um erro do provedor ou ser interrompido. Como o
 praticamente inalcançável. Para restaurar uma proteção, configure um número,
 por exemplo `GAIA_MAX_STEPS=30`.
 
+O limite numérico de passos não encerra a pesquisa, mas um detector de
+estagnação evita ciclos que repetem buscas sem avançar. Ao detectar repetição,
+o agente interrompe as ferramentas e pede ao próprio Gemini que consolide a
+melhor resposta usando as evidências já coletadas. Os valores podem ser
+ajustados com `GAIA_STAGNATION_TOOL_CALLS`,
+`GAIA_STAGNATION_SEARCH_CALLS` e `GAIA_STAGNATION_DUPLICATES`.
+
 ### Descobrir o `chat_id`
 
 1. Cadastre somente o novo `TELEGRAM_BOT_TOKEN`.

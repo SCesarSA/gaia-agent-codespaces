@@ -38,7 +38,6 @@ ATTACHMENT_CACHE = {}
 WEBPAGE_CACHE = {}
 SEARCH_CACHE = {}
 SEARCH_LOCK = threading.Lock()
-RUN_STATE = threading.local()
 OFFICIAL_QUESTIONS_CACHE = []
 QUESTIONS_CACHE_LOCK = threading.Lock()
 QUESTIONS_SOURCE = ""
@@ -47,6 +46,169 @@ QUESTIONS_SOURCE = ""
 def compact_error(exc: Exception) -> str:
     message = str(exc).strip()
     return message or repr(exc)
+
+
+class ResearchStagnationError(RuntimeError):
+    """Raised when tool usage is no longer producing useful new evidence."""
+
+
+class RunEvidenceTracker:
+    """Thread-safe evidence recorder with loop/stagnation detection."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.interrupt_callback = None
+        self.max_tool_calls = self._env_int("GAIA_STAGNATION_TOOL_CALLS", 14)
+        self.max_discovery_calls = self._env_int(
+            "GAIA_STAGNATION_SEARCH_CALLS", 8
+        )
+        self.max_duplicate_observations = self._env_int(
+            "GAIA_STAGNATION_DUPLICATES", 2
+        )
+        self.reset()
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return max(1, int(str(os.getenv(name) or default)))
+        except (TypeError, ValueError):
+            return default
+
+    def reset(self, question: str = ""):
+        with self.lock:
+            self.question = str(question or "")
+            self.evidence = []
+            self.seen_observations = set()
+            self.tool_calls = 0
+            self.discovery_calls = 0
+            self.duplicate_observations = 0
+            self.low_value_streak = 0
+            self.stagnated = False
+            self.stagnation_reason = ""
+
+    @staticmethod
+    def _observation_signature(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", text.casefold())
+        normalized = re.sub(r"\b\d+(?:\.\d+)?s\b", "", normalized)
+        return normalized[:2_500]
+
+    def record(self, tool_name: str, value) -> str:
+        text = str(value or "").strip()
+        callback = None
+        with self.lock:
+            self.tool_calls += 1
+            if tool_name in {"web_search", "wikipedia_search"}:
+                self.discovery_calls += 1
+
+            if text:
+                signature = self._observation_signature(text)
+                duplicate = signature in self.seen_observations
+                if duplicate:
+                    self.duplicate_observations += 1
+                else:
+                    self.seen_observations.add(signature)
+                self.evidence.append(
+                    {
+                        "tool": str(tool_name),
+                        "text": text[:5_000],
+                    }
+                )
+
+                lowered = text.casefold()
+                low_value = duplicate or any(
+                    cue in lowered
+                    for cue in (
+                        "duplicate search skipped",
+                        "no search results found",
+                        "no wikipedia page found",
+                        "no html tables were found",
+                        "error fetching",
+                        "web search failed",
+                        "rate limited",
+                    )
+                )
+                self.low_value_streak = (
+                    self.low_value_streak + 1 if low_value else 0
+                )
+
+            reason = ""
+            if self.duplicate_observations >= self.max_duplicate_observations:
+                reason = (
+                    "resultados de ferramentas repetidos "
+                    f"{self.duplicate_observations} vezes"
+                )
+            elif self.low_value_streak >= 3:
+                reason = (
+                    f"{self.low_value_streak} ferramentas consecutivas sem "
+                    "evidência útil"
+                )
+            elif self.discovery_calls >= self.max_discovery_calls:
+                reason = (
+                    f"{self.discovery_calls} buscas de descoberta sem "
+                    "resposta final"
+                )
+            elif self.tool_calls >= self.max_tool_calls:
+                reason = (
+                    f"{self.tool_calls} chamadas de ferramenta sem "
+                    "resposta final"
+                )
+
+            if reason and not self.stagnated:
+                self.stagnated = True
+                self.stagnation_reason = reason
+                callback = self.interrupt_callback
+
+        if callable(callback):
+            callback()
+        return value
+
+    def current(self, max_chars: int = 18_000) -> str:
+        with self.lock:
+            items = list(self.evidence)
+            question = self.question
+        if not items:
+            return ""
+
+        terms = {
+            token.casefold()
+            for token in re.findall(
+                r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'._-]{2,}",
+                question,
+            )
+            if token.casefold()
+            not in {
+                "about", "between", "from", "have", "how", "many",
+                "question", "that", "the", "their", "this", "what",
+                "when", "where", "which", "with",
+            }
+        }
+        scored = []
+        for index, item in enumerate(items):
+            lowered = item["text"].casefold()
+            hits = sum(1 for term in terms if term in lowered)
+            useful = not any(
+                cue in lowered
+                for cue in (
+                    "duplicate search skipped",
+                    "no search results found",
+                    "error fetching",
+                    "rate limited",
+                )
+            )
+            scored.append((hits * 5 + int(useful), index, item))
+
+        selected = sorted(scored, reverse=True)[:10]
+        selected.sort(key=lambda entry: entry[1])
+        blocks = []
+        used = 0
+        for _, index, item in selected:
+            block = f"[{index + 1}. {item['tool']}]\n{item['text']}"
+            remaining = max_chars - used
+            if remaining <= 100:
+                break
+            blocks.append(block[:remaining])
+            used += len(blocks[-1]) + 2
+        return "\n\n".join(blocks)
 
 
 def _direct_gaia_questions() -> list[dict]:
@@ -198,47 +360,13 @@ def fetch_official_questions(force_refresh: bool = False) -> list[dict]:
         return [dict(item) for item in normalized]
 
 
-def reset_run_evidence():
-    RUN_STATE.evidence = []
-
-
-def record_run_evidence(tool_name: str, value) -> str:
-    text = str(value or "").strip()
-    if text:
-        evidence = getattr(RUN_STATE, "evidence", None)
-        if evidence is None:
-            evidence = []
-            RUN_STATE.evidence = evidence
-        evidence.append(
-            {
-                "tool": str(tool_name),
-                "text": text[:5_000],
-            }
-        )
-    return value
-
-
-def current_run_evidence(max_chars: int = 14_000) -> str:
-    items = getattr(RUN_STATE, "evidence", []) or []
-    blocks = []
-    used = 0
-    for index, item in enumerate(items, start=1):
-        block = f"[{index}. {item['tool']}]\n{item['text']}"
-        remaining = max_chars - used
-        if remaining <= 100:
-            break
-        blocks.append(block[:remaining])
-        used += len(blocks[-1]) + 2
-    return "\n\n".join(blocks)
-
-
-def instrument_tool(tool: Tool) -> Tool:
+def instrument_tool(tool: Tool, tracker: RunEvidenceTracker) -> Tool:
     """Records tool observations for deterministic review and failover."""
     original_forward = tool.forward
 
     def recorded_forward(*args, **kwargs):
         result = original_forward(*args, **kwargs)
-        return record_run_evidence(tool.name, result)
+        return tracker.record(tool.name, result)
 
     tool.forward = recorded_forward
     return tool
@@ -616,6 +744,96 @@ class ConciseWebSearchTool(Tool):
                 return output
             except Exception as exc:
                 return f"Web search failed: {compact_error(exc)}"
+
+
+class WikipediaRevisionTool(Tool):
+    name = "wikipedia_revision"
+    description = (
+        "Reads the last English Wikipedia revision on or before December 31 "
+        "of a requested year, including raw table content that ordinary "
+        "Wikipedia summaries may omit. Use it whenever a task specifies a "
+        "Wikipedia version, snapshot, revision, or year."
+    )
+    inputs = {
+        "title": {
+            "type": "string",
+            "description": "Exact or likely English Wikipedia page title.",
+        },
+        "year": {
+            "type": "integer",
+            "description": "Snapshot year, for example 2022.",
+        },
+        "query": {
+            "type": "string",
+            "description": "Short terms for the target section, row, or fact.",
+        },
+    }
+    output_type = "string"
+
+    def forward(self, title: str, year: int, query: str) -> str:
+        title = " ".join(str(title or "").split())
+        query = " ".join(str(query or "").split())
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            return "Invalid Wikipedia revision year."
+        if not title or year < 2001 or year > 2100:
+            return "Provide a page title and a valid Wikipedia revision year."
+
+        try:
+            response = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "prop": "revisions",
+                    "titles": title,
+                    "redirects": 1,
+                    "rvstart": f"{year}-12-31T23:59:59Z",
+                    "rvdir": "older",
+                    "rvlimit": 1,
+                    "rvprop": "ids|timestamp|content",
+                    "rvslots": "main",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                headers={
+                    "User-Agent": (
+                        "GAIA-Course-Agent/1.0 "
+                        "(educational project; Wikipedia revision reader)"
+                    )
+                },
+                timeout=(WEBPAGE_CONNECT_TIMEOUT, WEBPAGE_READ_TIMEOUT),
+            )
+            response.raise_for_status()
+            pages = response.json().get("query", {}).get("pages", [])
+            page = pages[0] if pages else {}
+            revisions = page.get("revisions") or []
+            if page.get("missing") or not revisions:
+                return (
+                    f"No English Wikipedia revision was found for '{title}' "
+                    f"on or before {year}-12-31."
+                )
+            revision = revisions[0]
+            content = (
+                revision.get("slots", {}).get("main", {}).get("content")
+                or revision.get("*")
+                or ""
+            )
+            if not content:
+                return "The Wikipedia revision contained no readable wikitext."
+            focused = focus_text(content, query, max_chars=7_000)
+            return (
+                f"Wikipedia page: {page.get('title', title)}\n"
+                f"Revision ID: {revision.get('revid', 'unknown')}\n"
+                f"Revision timestamp: {revision.get('timestamp', 'unknown')}\n"
+                f"Snapshot rule: last revision on or before {year}-12-31\n\n"
+                f"{focused}"
+            )
+        except Exception as exc:
+            return (
+                "Could not read the historical Wikipedia revision: "
+                f"{compact_error(exc)}"
+            )
 
 
 class OpenWebPageTool(Tool):
@@ -1647,13 +1865,13 @@ class BasicAgent:
         self.model = LiteLLMModel(
             model_id=model_id,
             api_key=gemini_api_key,
-            temperature=0,
             max_tokens=1_200,
             reasoning_effort="low",
             requests_per_minute=8,
         )
         self.hf_token = hf_token
         self.model_id = model_id
+        self.run_tracker = RunEvidenceTracker()
         configured_max_steps = str(
             os.getenv("GAIA_MAX_STEPS") or "unlimited"
         ).strip()
@@ -1684,10 +1902,9 @@ class BasicAgent:
             language="en",
         )
         wikipedia_tool.description = (
-            "Searches English Wikipedia content directly. Use it for questions "
-            "that explicitly mention Wikipedia or for encyclopedic facts. "
-            "For version-specific or nomination details, verify the exact page "
-            "or archive with visit_webpage."
+            "Searches current English Wikipedia content directly. Use it for "
+            "encyclopedic facts when no historical version is requested. For "
+            "a version-specific year, use wikipedia_revision instead."
         )
 
         agent_tools = [
@@ -1696,6 +1913,7 @@ class BasicAgent:
             QueryWebTableTool(),
             MlbStatsTool(),
             ReadDocumentUrlTool(),
+            WikipediaRevisionTool(),
             wikipedia_tool,
             InspectGaiaAttachmentTool(),
             QueryGaiaSpreadsheetTool(),
@@ -1704,7 +1922,10 @@ class BasicAgent:
             AnalyzeGaiaImageTool(),
             CalculatorTool(),
         ]
-        agent_tools = [instrument_tool(tool) for tool in agent_tools]
+        agent_tools = [
+            instrument_tool(tool, self.run_tracker)
+            for tool in agent_tools
+        ]
         self.tools_by_name = {tool.name: tool for tool in agent_tools}
 
         # Gemini returns native function calls. ToolCallingAgent handles that
@@ -1738,8 +1959,10 @@ TOOL ROUTING POLICY:
    Never send a whole table to the model.
 5. analyze_gaia_image handles attached images. youtube_transcript handles
    spoken YouTube content. calculator evaluates arithmetic locally.
-6. wikipedia_search is for Wikipedia or encyclopedic facts. Verify historical,
-   nomination, revision, or archive details with an exact webpage.
+6. wikipedia_search is for current Wikipedia or encyclopedic facts.
+   wikipedia_revision is mandatory when the task specifies a Wikipedia
+   version/year; it preserves historical table rows omitted by summaries.
+   Verify other historical, nomination, or archive details with an exact page.
 
 Research carefully, prefer primary or official sources, and cross-check
 uncertain facts. A search snippet alone is insufficient when the source page
@@ -1769,6 +1992,7 @@ include reasoning, explanations, labels, Markdown, citations, or the words
             + "\n\n"
             + self.agent.prompt_templates["system_prompt"]
         )
+        self.run_tracker.interrupt_callback = self.agent.interrupt
 
     def interrupt(self):
         """Interrompe com segurança a execução atual do smolagents."""
@@ -1999,6 +2223,10 @@ COLLECTED EVIDENCE:
         try:
             return self.agent.run(task_context, reset=True)
         except Exception as exc:
+            if self.run_tracker.stagnated:
+                raise ResearchStagnationError(
+                    self.run_tracker.stagnation_reason
+                ) from exc
             error_text = str(exc).lower()
             retryable_provider_error = any(
                 marker in error_text
@@ -2029,7 +2257,7 @@ COLLECTED EVIDENCE:
         if not question:
             raise ValueError("Digite uma pergunta para testar o agente.")
         SEARCH_CACHE.clear()
-        reset_run_evidence()
+        self.run_tracker.reset(question)
         attachment_name = ""
 
         if task_id:
@@ -2075,7 +2303,7 @@ COLLECTED EVIDENCE:
             task_id=task_id,
             attachment_name=attachment_name,
         )
-        precollected = current_run_evidence()
+        precollected = self.run_tracker.current()
         if precollected:
             task_context += (
                 "\n\nCONTROLLER-PRECOLLECTED EVIDENCE:\n"
@@ -2086,6 +2314,21 @@ COLLECTED EVIDENCE:
             )
         try:
             result = self._run_gemini(task_context)
+        except ResearchStagnationError as exc:
+            evidence = self.run_tracker.current()
+            if not evidence:
+                raise RuntimeError(
+                    "A pesquisa estagnou sem produzir evidência utilizável."
+                ) from exc
+            print(
+                "Pesquisa interrompida por estagnação; consolidando as "
+                f"evidências. Motivo: {exc}"
+            )
+            result = self._gemini_answer_from_evidence(
+                question=question,
+                evidence=evidence,
+                task_id=task_id,
+            )
         except Exception as exc:
             error_text = str(exc)
             if (
@@ -2118,12 +2361,12 @@ COLLECTED EVIDENCE:
         invalid_candidate = (
             invalid_candidate or self._invalid_candidate(candidate)
         )
-        if invalid_candidate and current_run_evidence():
+        if invalid_candidate and self.run_tracker.current():
             print(
                 "Gemini terminou sem resposta final; tentando consolidar "
                 "somente as evidências já coletadas."
             )
-            evidence = current_run_evidence()
+            evidence = self.run_tracker.current()
             try:
                 candidate = self._gemini_answer_from_evidence(
                     question=question,
@@ -2163,7 +2406,7 @@ COLLECTED EVIDENCE:
             question=question,
             candidate=candidate,
             task_id=task_id,
-            evidence=current_run_evidence(),
+            evidence=self.run_tracker.current(),
         )
 
     @staticmethod
