@@ -17,6 +17,24 @@ Gradio, Cerebras, Gemini e ferramentas locais/web.
 5. Abra a porta **7860** quando o Codespaces exibir a notificação. A porta é
    privada por padrão.
 
+### Se aparecer `No module named 'gradio'`
+
+No Codespace atual, instale imediatamente:
+
+```bash
+python -m pip install -r requirements.txt
+python app.py
+```
+
+Depois de receber uma atualização do arquivo `.devcontainer/Dockerfile`, use a
+Paleta de Comandos (`Ctrl+Shift+P`) e execute:
+
+```text
+Codespaces: Rebuild Container
+```
+
+As dependências passam a ser instaladas durante a construção da imagem.
+
 ## Secrets necessários
 
 Cadastre em **Settings → Secrets and variables → Codespaces**:

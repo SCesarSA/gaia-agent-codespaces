@@ -1,6 +1,9 @@
 {
   "name": "GAIA Agent",
-  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
   "forwardPorts": [
     7860
   ],
@@ -11,7 +14,7 @@
       "visibility": "private"
     }
   },
-  "postCreateCommand": "python -m pip install --upgrade pip && python -m pip install -r requirements.txt",
+  "postCreateCommand": "python -m pip check && python -c \"import gradio, smolagents, litellm; print('GAIA dependencies ready')\"",
   "remoteEnv": {
     "GRADIO_SERVER_NAME": "0.0.0.0",
     "GRADIO_SERVER_PORT": "7860",
