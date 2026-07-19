@@ -80,9 +80,7 @@ class TelegramGaiaBot:
         message = str(exc)
         for variable in (
             "TELEGRAM_BOT_TOKEN",
-            "CEREBRAS_API_KEY",
             "GEMINI_API_KEY",
-            "OPENAI_API_KEY",
             "HF_TOKEN",
         ):
             secret = str(os.getenv(variable) or "").strip()
@@ -406,54 +404,24 @@ class TelegramGaiaBot:
 
     @staticmethod
     def _chat_model_config() -> tuple[str, str]:
-        configured = str(os.getenv("TELEGRAM_MODEL_ID") or "").strip()
-        if configured:
-            model_id = configured
-        elif os.getenv("CEREBRAS_API_KEY"):
-            model_id = str(
-                os.getenv("GAIA_MODEL_ID") or "cerebras/zai-glm-4.7"
-            ).strip()
-        elif os.getenv("GEMINI_API_KEY"):
-            gemini_name = str(
-                os.getenv("GAIA_GEMINI_FALLBACK_MODEL")
-                or "gemini-3.5-flash"
-            ).strip()
-            model_id = f"gemini/{gemini_name}"
-        else:
-            raise RuntimeError(
-                "Configure CEREBRAS_API_KEY ou GEMINI_API_KEY."
-            )
-
-        if model_id.startswith("cerebras/"):
-            api_key = str(os.getenv("CEREBRAS_API_KEY") or "").strip()
-        elif model_id.startswith("gemini/"):
-            api_key = str(os.getenv("GEMINI_API_KEY") or "").strip()
-        elif model_id.startswith("openai/"):
-            api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
-        else:
-            api_key = ""
+        model_name = str(
+            os.getenv("TELEGRAM_GEMINI_MODEL")
+            or os.getenv("GAIA_GEMINI_MODEL")
+            or "gemini-3.5-flash"
+        ).strip()
+        model_name = model_name.removeprefix("gemini/")
+        if not model_name.startswith("gemini-"):
+            model_name = "gemini-3.5-flash"
+        model_id = f"gemini/{model_name}"
+        api_key = str(os.getenv("GEMINI_API_KEY") or "").strip()
         if not api_key:
-            raise RuntimeError(
-                f"A chave de API necessária para {model_id} não está configurada."
-            )
+            raise RuntimeError("GEMINI_API_KEY não está configurada.")
         return model_id, api_key
 
     def _chat(self, chat_id: str | int, text: str) -> str:
         import litellm
 
         model_id, api_key = self._chat_model_config()
-        candidates = [(model_id, api_key)]
-        if not model_id.startswith("gemini/") and os.getenv("GEMINI_API_KEY"):
-            gemini_name = str(
-                os.getenv("GAIA_GEMINI_FALLBACK_MODEL")
-                or "gemini-3.5-flash"
-            ).strip()
-            candidates.append(
-                (
-                    f"gemini/{gemini_name}",
-                    str(os.getenv("GEMINI_API_KEY")).strip(),
-                )
-            )
         state = self._state_for(chat_id)
         system_message = {
             "role": "system",
@@ -472,30 +440,17 @@ class TelegramGaiaBot:
                 *state.history[-12:],
                 {"role": "user", "content": text},
             ]
-            errors = []
-            answer = ""
-            for candidate_model, candidate_key in candidates:
-                try:
-                    response = litellm.completion(
-                        model=candidate_model,
-                        api_key=candidate_key,
-                        messages=messages,
-                        temperature=0.2,
-                        max_tokens=700,
-                        drop_params=True,
-                    )
-                    answer = str(
-                        response.choices[0].message.content or ""
-                    ).strip()
-                    if answer:
-                        break
-                except Exception as exc:
-                    errors.append(f"{candidate_model}: {exc}")
+            response = litellm.completion(
+                model=model_id,
+                api_key=api_key,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=700,
+                drop_params=True,
+            )
+            answer = str(response.choices[0].message.content or "").strip()
             if not answer:
-                raise RuntimeError(
-                    "Nenhum modelo conseguiu responder. "
-                    + " | ".join(errors)
-                )
+                raise RuntimeError("O Gemini retornou uma resposta vazia.")
             state.history.extend(
                 [
                     {"role": "user", "content": text},

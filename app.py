@@ -29,8 +29,8 @@ MAX_EXTRACTED_CHARS = 8_000
 WEBPAGE_CONNECT_TIMEOUT = 8
 WEBPAGE_READ_TIMEOUT = 20
 MAX_WEBPAGE_CHARS = 3_500
-DEFAULT_MAIN_MODEL = "cerebras/zai-glm-4.7"
-DEFAULT_GEMINI_REVIEW_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_REVIEW_MODEL = DEFAULT_GEMINI_MODEL
 GAIA_ROWS_API = "https://datasets-server.huggingface.co/rows"
 TASK_FILE_CACHE = {}
 ATTACHMENT_CACHE = {}
@@ -1624,28 +1624,31 @@ class BasicAgent:
         print("Inicializando o agente GAIA...")
 
         hf_token = os.getenv("HF_TOKEN")
-        cerebras_api_key = os.getenv("CEREBRAS_API_KEY")
-        configured_model = os.getenv("GAIA_MODEL_ID")
-
-        model_id = configured_model or DEFAULT_MAIN_MODEL
-        if not model_id.lower().startswith("cerebras/"):
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        configured_model = str(
+            os.getenv("GAIA_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+        ).strip()
+        model_name = configured_model.removeprefix("gemini/")
+        if not model_name.lower().startswith("gemini-"):
             print(
-                "GAIA_MODEL_ID não apontava para um modelo Cerebras "
+                "GAIA_GEMINI_MODEL não apontava para um modelo Gemini "
                 "e foi ignorado. "
-                f"Usando {DEFAULT_MAIN_MODEL}."
+                f"Usando {DEFAULT_GEMINI_MODEL}."
             )
-            model_id = DEFAULT_MAIN_MODEL
-        if not cerebras_api_key:
+            model_name = DEFAULT_GEMINI_MODEL
+        model_id = f"gemini/{model_name}"
+        if not gemini_api_key:
             raise RuntimeError(
-                "O secret CEREBRAS_API_KEY não está configurado. "
+                "O secret GEMINI_API_KEY não está configurado. "
                 "Adicione a chave em Settings > Variables and secrets > Secrets."
             )
 
         self.model = LiteLLMModel(
             model_id=model_id,
-            api_key=cerebras_api_key,
+            api_key=gemini_api_key,
             temperature=0,
-            max_tokens=1_000,
+            max_tokens=1_200,
+            reasoning_effort="low",
             requests_per_minute=8,
         )
         self.hf_token = hf_token
@@ -1682,7 +1685,7 @@ class BasicAgent:
         agent_tools = [instrument_tool(tool) for tool in agent_tools]
         self.tools_by_name = {tool.name: tool for tool in agent_tools}
 
-        # GLM returns native tool calls. ToolCallingAgent handles that
+        # Gemini returns native function calls. ToolCallingAgent handles that
         # structured format without parsing generated Python code.
         self.agent = ToolCallingAgent(
             tools=agent_tools,
@@ -1744,39 +1747,6 @@ include reasoning, explanations, labels, Markdown, citations, or the words
             + "\n\n"
             + self.agent.prompt_templates["system_prompt"]
         )
-
-        # Cerebras is primary. Gemini is a real failover agent as well as an
-        # optional final reviewer, so a provider billing/quota error does not
-        # automatically discard the current question.
-        self.gemini_fallback_agent = None
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
-        if gemini_api_key:
-            fallback_name = os.getenv(
-                "GAIA_GEMINI_FALLBACK_MODEL", DEFAULT_GEMINI_REVIEW_MODEL
-            )
-            if not fallback_name.lower().startswith("gemini-"):
-                fallback_name = DEFAULT_GEMINI_REVIEW_MODEL
-            fallback_model = LiteLLMModel(
-                model_id=f"gemini/{fallback_name}",
-                api_key=gemini_api_key,
-                max_tokens=1_200,
-                reasoning_effort="low",
-                requests_per_minute=8,
-            )
-            self.gemini_fallback_agent = ToolCallingAgent(
-                tools=agent_tools,
-                model=fallback_model,
-                max_steps=6,
-                max_tool_threads=1,
-                planning_interval=None,
-                description="Gemini fallback agent for GAIA exact-match tasks.",
-            )
-            self.gemini_fallback_agent.prompt_templates["system_prompt"] = (
-                exact_match_prompt.strip()
-                + "\n\n"
-                + self.gemini_fallback_agent.prompt_templates["system_prompt"]
-            )
-            print(f"Fallback Gemini habilitado: {fallback_name}")
 
     def _precollect_deterministic_evidence(
         self,
@@ -1924,13 +1894,14 @@ include reasoning, explanations, labels, Markdown, citations, or the words
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY não está configurada para o fallback."
+                "GEMINI_API_KEY não está configurada."
             )
         model = os.getenv(
-            "GAIA_GEMINI_FALLBACK_MODEL", DEFAULT_GEMINI_REVIEW_MODEL
+            "GAIA_GEMINI_MODEL", DEFAULT_GEMINI_MODEL
         )
+        model = str(model).removeprefix("gemini/")
         if not model.lower().startswith("gemini-"):
-            model = DEFAULT_GEMINI_REVIEW_MODEL
+            model = DEFAULT_GEMINI_MODEL
         prompt = f"""
 Answer this GAIA task using ONLY the collected evidence below. Do not call or
 suggest tools and do not perform another search. If the evidence is sufficient,
@@ -1993,19 +1964,14 @@ COLLECTED EVIDENCE:
         )
         if self._invalid_candidate(answer):
             raise RuntimeError(
-                "O fallback Gemini não produziu uma resposta final válida."
+                "O Gemini não produziu uma resposta final válida."
             )
         print(f"Gemini respondeu usando as evidências existentes: {answer}")
         return answer
 
-    def _run_with_failover(
-        self,
-        task_context: str,
-        question: str,
-        task_id: str | None,
-    ):
+    def _run_gemini(self, task_context: str):
         try:
-            return self.agent.run(task_context, reset=True), False
+            return self.agent.run(task_context, reset=True)
         except Exception as exc:
             error_text = str(exc).lower()
             retryable_provider_error = any(
@@ -2024,30 +1990,11 @@ COLLECTED EVIDENCE:
                     "timeout",
                 )
             )
-            if retryable_provider_error and self.gemini_fallback_agent:
-                evidence = current_run_evidence()
-                print(
-                    "Cerebras indisponível; executando a questão com o "
-                    f"fallback Gemini. Motivo: {compact_error(exc)}"
-                )
-                if evidence:
-                    return (
-                        self._gemini_answer_from_evidence(
-                            question=question,
-                            evidence=evidence,
-                            task_id=task_id,
-                        ),
-                        True,
-                    )
-                return (
-                    self.gemini_fallback_agent.run(task_context, reset=True),
-                    True,
-                )
             if retryable_provider_error:
                 raise RuntimeError(
-                    "O Cerebras recusou a chamada e o fallback Gemini não "
-                    "está disponível. Configure GEMINI_API_KEY ou verifique "
-                    f"a cota do Cerebras. Detalhe: {compact_error(exc)}"
+                    "O Gemini recusou a chamada. Verifique GEMINI_API_KEY, "
+                    "a cota e os limites do projeto no Google AI Studio. "
+                    f"Detalhe: {compact_error(exc)}"
                 ) from exc
             raise
 
@@ -2112,11 +2059,7 @@ COLLECTED EVIDENCE:
                 "If this evidence answers the question, call final_answer now."
             )
         try:
-            result, used_gemini_fallback = self._run_with_failover(
-                task_context=task_context,
-                question=question,
-                task_id=task_id,
-            )
+            result = self._run_gemini(task_context)
         except Exception as exc:
             error_text = str(exc)
             if (
@@ -2126,8 +2069,7 @@ COLLECTED EVIDENCE:
             ):
                 raise RuntimeError(
                     f"Falha de autenticação no modelo {self.model_id}. "
-                    "Verifique se HF_TOKEN possui permissão para usar "
-                    "Inference Providers."
+                    "Verifique o secret GEMINI_API_KEY."
                 ) from exc
             raise
         candidate = self.enforce_direct_answer(question, str(result))
@@ -2150,29 +2092,22 @@ COLLECTED EVIDENCE:
         invalid_candidate = (
             invalid_candidate or self._invalid_candidate(candidate)
         )
-        if (
-            invalid_candidate
-            and self.gemini_fallback_agent
-            and not used_gemini_fallback
-        ):
+        if invalid_candidate and current_run_evidence():
             print(
-                "Cerebras terminou sem resposta final; repetindo a questão "
-                "com o fallback Gemini."
+                "Gemini terminou sem resposta final; tentando consolidar "
+                "somente as evidências já coletadas."
             )
             evidence = current_run_evidence()
-            used_gemini_fallback = True
-            if evidence:
+            try:
                 candidate = self._gemini_answer_from_evidence(
                     question=question,
                     evidence=evidence,
                     task_id=task_id,
                 )
-            else:
-                result = self.gemini_fallback_agent.run(
-                    task_context, reset=True
-                )
-                candidate = self.enforce_direct_answer(
-                    question, str(result)
+            except Exception as exc:
+                print(
+                    "A consolidação Gemini falhou: "
+                    f"{compact_error(exc)}"
                 )
             invalid_candidate = (
                 not candidate
@@ -2198,9 +2133,6 @@ COLLECTED EVIDENCE:
                 "O agente esgotou as etapas sem produzir uma resposta final. "
                 "A resposta não foi salva; execute novamente esta questão."
             )
-        if used_gemini_fallback:
-            print(f"Resposta final produzida pelo fallback Gemini: {candidate}")
-            return candidate
         return self.review_answer_with_gemini(
             question=question,
             candidate=candidate,

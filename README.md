@@ -1,7 +1,7 @@
 # GAIA Agent — GitHub Codespaces
 
 Agente educacional para executar e revisar as perguntas da avaliação GAIA com
-Gradio, Cerebras, Gemini e ferramentas locais/web.
+Gradio, Gemini e ferramentas locais/web.
 
 ## Executar no GitHub Codespaces
 
@@ -39,8 +39,7 @@ As dependências passam a ser instaladas durante a construção da imagem.
 
 Cadastre em **Settings → Secrets and variables → Codespaces**:
 
-- `CEREBRAS_API_KEY`: modelo principal.
-- `GEMINI_API_KEY`: fallback e revisão.
+- `GEMINI_API_KEY`: modelo principal e revisão das respostas.
 - `HF_TOKEN`: questões e anexos do dataset GAIA quando a API do exercício
   estiver indisponível.
 
@@ -70,7 +69,6 @@ No Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-$env:CEREBRAS_API_KEY="..."
 $env:GEMINI_API_KEY="..."
 $env:HF_TOKEN="..."
 python app.py
@@ -112,12 +110,11 @@ Cadastre o novo valor em **Settings → Secrets and variables → Codespaces**:
 
 - `TELEGRAM_BOT_TOKEN`: novo token gerado pelo BotFather.
 - `TELEGRAM_ALLOWED_CHAT_ID`: único chat autorizado a controlar o agente.
-- `TELEGRAM_MODEL_ID`: opcional; por padrão usa o Cerebras configurado e depois
-  o Gemini quando somente a chave dele estiver disponível.
+- `TELEGRAM_GEMINI_MODEL`: opcional; por padrão usa `gemini-3.5-flash`.
 
-Também é possível usar um modelo OpenAI configurando `TELEGRAM_MODEL_ID` com o
-prefixo `openai/` e cadastrando `OPENAI_API_KEY`. A cobrança da API é separada
-da assinatura do ChatGPT.
+O agente e a conversa do Telegram utilizam exclusivamente o Gemini. Para trocar
+o modelo Gemini principal, configure `GAIA_GEMINI_MODEL`; para trocar somente o
+modelo da conversa, configure `TELEGRAM_GEMINI_MODEL`.
 
 ### Descobrir o `chat_id`
 
