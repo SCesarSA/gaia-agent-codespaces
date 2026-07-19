@@ -96,3 +96,53 @@ revisão e poderão ser enviadas quando o serviço voltar.
 
 O Codespaces é indicado para desenvolvimento e testes. Ele pode parar por
 inatividade e não deve ser tratado como hospedagem pública permanente.
+
+## Bot do Telegram
+
+O mesmo processo de `app.py` pode iniciar um bot do Telegram. O bot conversa
+usando o modelo configurado e chama diretamente as funções do agente GAIA; ele
+não compartilha esta conversa do Codex nem controla uma aba já aberta.
+
+### Segurança obrigatória
+
+Se um token foi publicado em uma conversa ou arquivo, revogue-o imediatamente
+com `/revoke` no BotFather e gere outro. Nunca coloque o token no código.
+
+Cadastre o novo valor em **Settings → Secrets and variables → Codespaces**:
+
+- `TELEGRAM_BOT_TOKEN`: novo token gerado pelo BotFather.
+- `TELEGRAM_ALLOWED_CHAT_ID`: único chat autorizado a controlar o agente.
+- `TELEGRAM_MODEL_ID`: opcional; por padrão usa o Cerebras configurado e depois
+  o Gemini quando somente a chave dele estiver disponível.
+
+Também é possível usar um modelo OpenAI configurando `TELEGRAM_MODEL_ID` com o
+prefixo `openai/` e cadastrando `OPENAI_API_KEY`. A cobrança da API é separada
+da assinatura do ChatGPT.
+
+### Descobrir o `chat_id`
+
+1. Cadastre somente o novo `TELEGRAM_BOT_TOKEN`.
+2. Reinicie o Codespace e execute `python app.py`.
+3. Abra o bot no Telegram, pressione **Start** e envie `/id`.
+4. Cadastre o número retornado como `TELEGRAM_ALLOWED_CHAT_ID`.
+5. Reinicie novamente o processo.
+
+Enquanto `TELEGRAM_ALLOWED_CHAT_ID` não estiver configurado, somente `/id`
+funciona.
+
+### Comandos
+
+- `/status`: verifica a API oficial e o fallback direto do GAIA.
+- `/sortear`: seleciona uma questão oficial aleatória.
+- `/questao TASK_ID`: seleciona uma questão específica.
+- `/executar`: executa a questão selecionada.
+- `/executar20 confirmar`: executa todas as questões após confirmação explícita.
+- `/respostas`: mostra as respostas mantidas na sessão do bot.
+- `/limpar`: remove o histórico e as respostas locais da sessão.
+
+Mensagens comuns, sem `/`, são encaminhadas ao modelo para conversa. O histórico
+é curto e mantido somente na memória do processo.
+
+O bot verifica o endpoint oficial a cada cinco minutos e envia uma mensagem
+quando ele passa de indisponível para disponível. Esse monitor só funciona
+enquanto o Codespace estiver ativo; o Codespaces pode suspender por inatividade.

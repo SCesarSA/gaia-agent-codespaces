@@ -3291,6 +3291,18 @@ with gr.Blocks(theme=gr.themes.Soft(), title="GAIA Agent Evaluation") as demo:
 
 
 if __name__ == "__main__":
+    if os.getenv("TELEGRAM_BOT_TOKEN"):
+        try:
+            from telegram_bot import start_telegram_bot
+
+            start_telegram_bot(
+                agent_factory=BasicAgent,
+                questions_loader=fetch_official_questions,
+                scoring_url=DEFAULT_API_URL,
+            )
+        except Exception as exc:
+            print(f"Não foi possível iniciar o bot do Telegram: {exc}")
+
     demo.launch(
         server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
         server_port=int(
