@@ -3,6 +3,9 @@
 Agente educacional para executar e revisar as perguntas da avaliação GAIA com
 Gradio, Gemini e ferramentas locais/web.
 
+Para uma explicação completa, em linguagem natural, consulte
+[Como o agente GAIA funciona](DOCUMENTACAO_AGENTE.md).
+
 ## Executar no GitHub Codespaces
 
 1. No GitHub, abra este repositório.
