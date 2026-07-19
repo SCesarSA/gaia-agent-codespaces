@@ -27,6 +27,7 @@ class TelegramChatState:
     task_id: str = ""
     question: str = ""
     last_answer: str = ""
+    questions: list[dict] = field(default_factory=list)
     answers: dict[str, str] = field(default_factory=dict)
     history: list[dict[str, str]] = field(default_factory=list)
 
@@ -37,6 +38,8 @@ class TelegramGaiaBot:
         agent_factory: Callable,
         questions_loader: Callable[[], list[dict]],
         scoring_url: str,
+        submission_callback: Callable[[list[dict], dict[str, str]], str]
+        | None = None,
     ):
         self.token = str(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
         if not self.token:
@@ -48,12 +51,15 @@ class TelegramGaiaBot:
         self.api_url = f"https://api.telegram.org/bot{self.token}"
         self.agent_factory = agent_factory
         self.questions_loader = questions_loader
+        self.submission_callback = submission_callback
         self.scoring_url = scoring_url.rstrip("/")
         self.session = requests.Session()
         self.chat_states: dict[str, TelegramChatState] = {}
         self.agent = None
         self.agent_lock = threading.Lock()
         self.chat_lock = threading.Lock()
+        self.batch_thread: threading.Thread | None = None
+        self.batch_cancel_event = threading.Event()
         self.stop_event = threading.Event()
         self.monitor_interval = max(
             60,
@@ -128,11 +134,18 @@ class TelegramGaiaBot:
             "Comandos disponíveis:\n"
             "/id — mostra seu chat_id\n"
             "/status — verifica a API oficial e o fallback GAIA\n"
+            "/carregar20 — carrega as questões sem chamar a LLM\n"
+            "/listar — lista as questões carregadas\n"
             "/sortear — seleciona uma questão oficial aleatória\n"
             "/questao TASK_ID — seleciona uma questão específica\n"
             "/executar — responde a questão selecionada\n"
-            "/executar20 confirmar — executa as 20 questões\n"
+            "/reexecutar TASK_ID — responde novamente uma questão\n"
+            "/executar20 — executa diretamente todas as questões\n"
+            "/parar — interrompe o lote após a questão atual\n"
+            "/progresso — mostra quantas respostas estão prontas\n"
             "/respostas — mostra as respostas desta sessão\n"
+            "/definir TASK_ID | RESPOSTA — edita uma resposta\n"
+            "/enviar confirmar — envia as respostas completas\n"
             "/limpar — apaga conversa e seleção atuais\n\n"
             "Qualquer mensagem sem / é respondida pelo modelo configurado. "
             "O bot é um assistente separado; não compartilha a sessão do Codex."
@@ -169,8 +182,37 @@ class TelegramGaiaBot:
                 f"Fallback GAIA também indisponível: {exc}"
             )
 
+    def _questions_for(self, chat_id: str | int) -> list[dict]:
+        state = self._state_for(chat_id)
+        if not state.questions:
+            state.questions = list(self.questions_loader())
+        return state.questions
+
+    def _load_all_questions(self, chat_id: str | int) -> str:
+        state = self._state_for(chat_id)
+        state.questions = list(self.questions_loader())
+        return (
+            f"{len(state.questions)} questões carregadas. "
+            "Nenhuma chamada de LLM foi realizada. Use /listar para ver os "
+            "Task IDs ou /executar20 para iniciar."
+        )
+
+    def _question_list_text(self, chat_id: str | int) -> str:
+        questions = self._questions_for(chat_id)
+        lines = []
+        for index, item in enumerate(questions, start=1):
+            task_id = str(item.get("task_id") or "").strip()
+            question = str(
+                item.get("question") or item.get("Question") or ""
+            ).strip()
+            preview = " ".join(question.split())
+            if len(preview) > 110:
+                preview = preview[:107] + "..."
+            lines.append(f"{index}. {task_id}\n{preview}")
+        return f"Questões carregadas: {len(lines)}\n\n" + "\n\n".join(lines)
+
     def _select_random_question(self, chat_id: str | int) -> str:
-        questions = self.questions_loader()
+        questions = self._questions_for(chat_id)
         item = random.choice(questions)
         state = self._state_for(chat_id)
         state.task_id = str(item.get("task_id") or "").strip()
@@ -190,7 +232,7 @@ class TelegramGaiaBot:
         item = next(
             (
                 question
-                for question in self.questions_loader()
+                for question in self._questions_for(chat_id)
                 if str(question.get("task_id") or "").strip() == wanted
             ),
             None,
@@ -230,12 +272,17 @@ class TelegramGaiaBot:
         )
 
     def _execute_all(self, chat_id: str | int) -> str:
-        questions = self.questions_loader()
+        questions = self._questions_for(chat_id)
         state = self._state_for(chat_id)
         failures = []
         with self.agent_lock:
             agent = self._agent_instance()
             for index, item in enumerate(questions, start=1):
+                if self.batch_cancel_event.is_set():
+                    return (
+                        f"Execução interrompida: {len(state.answers)}/"
+                        f"{len(questions)} respostas salvas."
+                    )
                 task_id = str(item.get("task_id") or "").strip()
                 question = str(
                     item.get("question") or item.get("Question") or ""
@@ -257,6 +304,98 @@ class TelegramGaiaBot:
             f"Execução concluída: {len(state.answers)}/{len(questions)} "
             f"respostas salvas. Falhas: {len(failures)}."
         )
+
+    def _batch_is_running(self) -> bool:
+        return bool(self.batch_thread and self.batch_thread.is_alive())
+
+    def _start_execute_all(self, chat_id: str | int) -> str:
+        if self._batch_is_running():
+            return (
+                "Já existe uma execução em andamento. Use /progresso para "
+                "acompanhar ou /parar para interromper."
+            )
+
+        self.batch_cancel_event.clear()
+
+        def worker():
+            try:
+                result = self._execute_all(chat_id)
+            except Exception as exc:
+                result = (
+                    "Erro na execução das 20 questões: "
+                    f"{self._safe_error(exc)}"
+                )
+            try:
+                self.send_message(chat_id, result)
+            except Exception as exc:
+                print(
+                    "Não foi possível enviar o resultado do lote: "
+                    f"{self._safe_error(exc)}"
+                )
+
+        self.batch_thread = threading.Thread(
+            target=worker,
+            name="telegram-gaia-batch",
+            daemon=True,
+        )
+        self.batch_thread.start()
+        return (
+            "Execução das questões iniciada em segundo plano. "
+            "Use /progresso para acompanhar ou /parar para interromper."
+        )
+
+    def _progress_text(self, chat_id: str | int) -> str:
+        state = self._state_for(chat_id)
+        questions = self._questions_for(chat_id)
+        task_ids = {
+            str(item.get("task_id") or "").strip() for item in questions
+        }
+        completed = sum(
+            1
+            for task_id, answer in state.answers.items()
+            if task_id in task_ids and str(answer).strip()
+        )
+        return (
+            f"Progresso: {completed}/{len(questions)} respostas prontas. "
+            f"Pendentes: {max(0, len(questions) - completed)}."
+        )
+
+    def _define_answer(self, chat_id: str | int, argument: str) -> str:
+        task_id, separator, answer = str(argument or "").partition("|")
+        task_id = task_id.strip()
+        answer = answer.strip()
+        if not separator or not task_id or not answer:
+            return "Uso: /definir TASK_ID | RESPOSTA"
+        valid_ids = {
+            str(item.get("task_id") or "").strip()
+            for item in self._questions_for(chat_id)
+        }
+        if task_id not in valid_ids:
+            return f"Task ID não encontrado: {task_id}"
+        state = self._state_for(chat_id)
+        state.answers[task_id] = answer
+        if state.task_id == task_id:
+            state.last_answer = answer
+        return f"Resposta de {task_id} atualizada para: {answer}"
+
+    def _submit_answers(self, chat_id: str | int) -> str:
+        if self.submission_callback is None:
+            return "Envio não está habilitado nesta execução."
+        state = self._state_for(chat_id)
+        questions = self._questions_for(chat_id)
+        missing = [
+            str(item.get("task_id") or "").strip()
+            for item in questions
+            if not str(
+                state.answers.get(str(item.get("task_id") or "").strip(), "")
+            ).strip()
+        ]
+        if missing:
+            return (
+                f"Envio bloqueado: faltam {len(missing)} respostas. "
+                "Use /progresso e conclua todas as questões."
+            )
+        return str(self.submission_callback(questions, state.answers))
 
     def _answers_text(self, chat_id: str | int) -> str:
         answers = self._state_for(chat_id).answers
@@ -395,27 +534,68 @@ class TelegramGaiaBot:
                 result = self.help_text()
             elif command == "/status":
                 result = self.status_text()
+            elif command == "/carregar20":
+                result = self._load_all_questions(chat_id)
+            elif command == "/listar":
+                result = self._question_list_text(chat_id)
             elif command == "/sortear":
                 result = self._select_random_question(chat_id)
             elif command == "/questao":
                 result = self._select_question(chat_id, argument)
             elif command == "/executar":
-                self.send_message(chat_id, "Executando a questão selecionada…")
-                result = self._execute_current(chat_id)
-            elif command == "/executar20":
-                if argument.strip().lower() != "confirmar":
+                if self._batch_is_running():
                     result = (
-                        "Esta ação pode consumir muitas chamadas de LLM. "
-                        "Use /executar20 confirmar para iniciar."
+                        "O lote está em execução. Use /parar antes de executar "
+                        "uma questão individual."
                     )
                 else:
                     self.send_message(
                         chat_id,
-                        "Executando as questões. Isso pode demorar vários minutos.",
+                        "Executando a questão selecionada…",
                     )
-                    result = self._execute_all(chat_id)
+                    result = self._execute_current(chat_id)
+            elif command == "/reexecutar":
+                selected = self._select_question(chat_id, argument)
+                if selected.startswith("Task ID não encontrado") or selected.startswith(
+                    "Uso:"
+                ):
+                    result = selected
+                elif self._batch_is_running():
+                    result = (
+                        "O lote está em execução. Use /parar antes de "
+                        "reexecutar uma questão."
+                    )
+                else:
+                    self.send_message(
+                        chat_id,
+                        f"Executando novamente {argument.strip()}…",
+                    )
+                    result = self._execute_current(chat_id)
+            elif command == "/executar20":
+                result = self._start_execute_all(chat_id)
+            elif command == "/parar":
+                if not self._batch_is_running():
+                    result = "Não existe uma execução em andamento."
+                else:
+                    self.batch_cancel_event.set()
+                    result = (
+                        "Interrupção solicitada. A execução será encerrada "
+                        "após a questão atual."
+                    )
+            elif command == "/progresso":
+                result = self._progress_text(chat_id)
             elif command == "/respostas":
                 result = self._answers_text(chat_id)
+            elif command == "/definir":
+                result = self._define_answer(chat_id, argument)
+            elif command == "/enviar":
+                if argument.strip().lower() != "confirmar":
+                    result = (
+                        "O envio registra a pontuação na API oficial. "
+                        "Use /enviar confirmar para prosseguir."
+                    )
+                else:
+                    result = self._submit_answers(chat_id)
             elif command == "/limpar":
                 self.chat_states[str(chat_id)] = TelegramChatState()
                 result = "Conversa, seleção e respostas locais apagadas."
@@ -512,6 +692,8 @@ def start_telegram_bot(
     agent_factory: Callable,
     questions_loader: Callable[[], list[dict]],
     scoring_url: str,
+    submission_callback: Callable[[list[dict], dict[str, str]], str]
+    | None = None,
 ) -> threading.Thread | None:
     """Starts one daemon bot thread when TELEGRAM_BOT_TOKEN is configured."""
     if not str(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip():
@@ -522,6 +704,7 @@ def start_telegram_bot(
         agent_factory=agent_factory,
         questions_loader=questions_loader,
         scoring_url=scoring_url,
+        submission_callback=submission_callback,
     )
     thread = threading.Thread(
         target=bot.run_forever,

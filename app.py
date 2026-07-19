@@ -3084,6 +3084,16 @@ def submit_to_leaderboard(
         return f"Erro inesperado no envio: {exc}"
 
 
+def submit_telegram_answers(
+    questions: list[dict], answers: dict[str, str]
+) -> str:
+    """Converte o estado revisado do Telegram para o mesmo fluxo da interface."""
+    return submit_to_leaderboard(
+        None,
+        review_dataframe(questions, answers),
+    )
+
+
 with gr.Blocks(theme=gr.themes.Soft(), title="GAIA Agent Evaluation") as demo:
     gr.Markdown("# GAIA Agent Evaluation")
     gr.Markdown(
@@ -3299,6 +3309,7 @@ if __name__ == "__main__":
                 agent_factory=BasicAgent,
                 questions_loader=fetch_official_questions,
                 scoring_url=DEFAULT_API_URL,
+                submission_callback=submit_telegram_answers,
             )
         except Exception as exc:
             print(f"Não foi possível iniciar o bot do Telegram: {exc}")

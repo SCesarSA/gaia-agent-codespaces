@@ -133,11 +133,18 @@ funciona.
 ### Comandos
 
 - `/status`: verifica a API oficial e o fallback direto do GAIA.
+- `/carregar20`: carrega as questões sem consumir chamadas de LLM.
+- `/listar`: lista os Task IDs e uma prévia de cada questão.
 - `/sortear`: seleciona uma questão oficial aleatória.
 - `/questao TASK_ID`: seleciona uma questão específica.
 - `/executar`: executa a questão selecionada.
-- `/executar20 confirmar`: executa todas as questões após confirmação explícita.
+- `/reexecutar TASK_ID`: executa novamente uma questão específica.
+- `/executar20`: executa diretamente todas as questões carregadas.
+- `/parar`: interrompe o lote após a conclusão da questão atual.
+- `/progresso`: mostra quantas respostas estão prontas.
 - `/respostas`: mostra as respostas mantidas na sessão do bot.
+- `/definir TASK_ID | RESPOSTA`: permite editar uma resposta.
+- `/enviar confirmar`: envia as 20 respostas para a API oficial.
 - `/limpar`: remove o histórico e as respostas locais da sessão.
 
 Mensagens comuns, sem `/`, são encaminhadas ao modelo para conversa. O histórico
