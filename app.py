@@ -856,6 +856,7 @@ class WikipediaFeaturedArticlesTool(Tool):
         },
         "subject": {
             "type": "string",
+            "nullable": True,
             "description": (
                 "Optional subject to identify, for example dinosaur. Use an "
                 "empty string to return every promotion in the month."
