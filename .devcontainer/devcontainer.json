@@ -1,0 +1,25 @@
+{
+  "name": "GAIA Agent",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+  "forwardPorts": [
+    7860
+  ],
+  "portsAttributes": {
+    "7860": {
+      "label": "GAIA Agent",
+      "onAutoForward": "openPreview",
+      "visibility": "private"
+    }
+  },
+  "postCreateCommand": "python -m pip install --upgrade pip && python -m pip install -r requirements.txt",
+  "remoteEnv": {
+    "GRADIO_SERVER_NAME": "0.0.0.0",
+    "GRADIO_SERVER_PORT": "7860",
+    "GRADIO_DEBUG": "true"
+  },
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "4gb",
+    "storage": "16gb"
+  }
+}

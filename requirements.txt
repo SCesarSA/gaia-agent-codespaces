@@ -1,0 +1,16 @@
+smolagents>=1.26.0
+gradio>=5.0
+pandas>=2.0
+requests>=2.31
+markdownify
+trafilatura>=2.0
+huggingface_hub
+litellm>=1.80.0
+ddgs
+beautifulsoup4
+pypdf
+python-docx
+openpyxl
+Pillow
+wikipedia-api
+youtube-transcript-api
