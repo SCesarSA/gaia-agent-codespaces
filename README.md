@@ -129,6 +129,12 @@ melhor resposta usando as evidências já coletadas. Os valores podem ser
 ajustados com `GAIA_STAGNATION_TOOL_CALLS`,
 `GAIA_STAGNATION_SEARCH_CALLS` e `GAIA_STAGNATION_DUPLICATES`.
 
+Perguntas sobre artigos destacados da Wikipédia promovidos em um mês específico
+seguem uma rota direta pela API pública da Wikipédia. A ferramenta
+`wikipedia_featured_articles` extrai somente as linhas daquele mês, identifica
+o tema pelos resumos e categorias e entrega artigo e nomeador ao Gemini. Isso
+evita buscas repetidas e páginas inteiras no contexto do modelo.
+
 ### Descobrir o `chat_id`
 
 1. Cadastre somente o novo `TELEGRAM_BOT_TOKEN`.

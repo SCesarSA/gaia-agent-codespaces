@@ -836,6 +836,229 @@ class WikipediaRevisionTool(Tool):
             )
 
 
+class WikipediaFeaturedArticlesTool(Tool):
+    name = "wikipedia_featured_articles"
+    description = (
+        "Reads the official English Wikipedia featured-article promotion "
+        "table for one month and year, returning article titles and "
+        "nominators. It can filter the rows by subject using each article's "
+        "intro and categories. Use it instead of web search for questions "
+        "about Featured Articles promoted in a specified month."
+    )
+    inputs = {
+        "year": {
+            "type": "integer",
+            "description": "Promotion year, for example 2016.",
+        },
+        "month": {
+            "type": "string",
+            "description": "English month name, for example November.",
+        },
+        "subject": {
+            "type": "string",
+            "description": (
+                "Optional subject to identify, for example dinosaur. Use an "
+                "empty string to return every promotion in the month."
+            ),
+        },
+    }
+    output_type = "string"
+
+    MONTHS = {
+        name.casefold(): name
+        for name in (
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        )
+    }
+
+    @staticmethod
+    def _wiki_link_value(cell: str, user: bool = False) -> str:
+        if user:
+            matches = re.findall(
+                r"\[\[\s*(?:User|User talk)\s*:\s*([^|\]]+)"
+                r"(?:\|([^\]]+))?\]\]",
+                cell,
+                flags=re.I,
+            )
+            values = [
+                re.sub(r"<[^>]+>", "", display or target).strip()
+                for target, display in matches
+                if (display or target).strip()
+            ]
+            return " & ".join(dict.fromkeys(values))
+
+        match = re.search(
+            r"\[\[\s*([^|\]#]+)(?:#[^|\]]*)?(?:\|([^\]]+))?\]\]",
+            cell,
+        )
+        if not match:
+            return re.sub(r"<[^>]+>", "", cell).strip(" |")
+        return re.sub(
+            r"<[^>]+>",
+            "",
+            match.group(1),
+        ).strip()
+
+    @staticmethod
+    def _article_metadata(titles: list[str]) -> dict[str, str]:
+        metadata = {}
+        for start in range(0, len(titles), 20):
+            response = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "prop": "extracts|categories",
+                    "titles": "|".join(titles[start:start + 20]),
+                    "redirects": 1,
+                    "exintro": 1,
+                    "explaintext": 1,
+                    "exsentences": 2,
+                    "cllimit": "max",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                headers={
+                    "User-Agent": (
+                        "GAIA-Course-Agent/1.0 "
+                        "(educational project; featured article reader)"
+                    )
+                },
+                timeout=(WEBPAGE_CONNECT_TIMEOUT, WEBPAGE_READ_TIMEOUT),
+            )
+            response.raise_for_status()
+            for page in response.json().get("query", {}).get("pages", []):
+                categories = " ".join(
+                    category.get("title", "")
+                    for category in page.get("categories", [])
+                )
+                metadata[str(page.get("title") or "")] = (
+                    f"{page.get('extract') or ''} {categories}"
+                ).casefold()
+        return metadata
+
+    def forward(self, year: int, month: str, subject: str = "") -> str:
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            return "Invalid featured-article promotion year."
+        normalized_month = self.MONTHS.get(
+            " ".join(str(month or "").split()).casefold()
+        )
+        subject = " ".join(str(subject or "").split()).strip()
+        if year < 2004 or year > 2100 or not normalized_month:
+            return "Provide a valid year and an English month name."
+
+        page_title = f"Wikipedia:Featured articles promoted in {year}"
+        try:
+            response = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "parse",
+                    "page": page_title,
+                    "prop": "wikitext",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+                headers={
+                    "User-Agent": (
+                        "GAIA-Course-Agent/1.0 "
+                        "(educational project; featured article reader)"
+                    )
+                },
+                timeout=(WEBPAGE_CONNECT_TIMEOUT, WEBPAGE_READ_TIMEOUT),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if "error" in payload:
+                return (
+                    "Wikipedia did not return the requested promotion page: "
+                    f"{payload['error'].get('info', 'unknown error')}"
+                )
+            wikitext = payload.get("parse", {}).get("wikitext", "")
+            section_match = re.search(
+                rf"==\s*Promoted in {re.escape(normalized_month)} {year}\s*=="
+                rf"(.*?)(?=\n==\s*Promoted in|\Z)",
+                wikitext,
+                flags=re.I | re.S,
+            )
+            if not section_match:
+                return (
+                    f"No promotion section was found for "
+                    f"{normalized_month} {year}."
+                )
+
+            rows = []
+            for row in re.split(r"\n\|-", section_match.group(1)):
+                if row.count("||") < 3 or "Article!!" in row:
+                    continue
+                article = self._wiki_link_value(row)
+                nominator = self._wiki_link_value(row, user=True)
+                if article and nominator:
+                    rows.append(
+                        {
+                            "article": article,
+                            "nominator": nominator,
+                        }
+                    )
+            if not rows:
+                return (
+                    f"No promotion rows could be parsed for "
+                    f"{normalized_month} {year}."
+                )
+
+            selected = rows
+            if subject:
+                metadata = self._article_metadata(
+                    [row["article"] for row in rows]
+                )
+                subject_terms = [
+                    term.casefold()
+                    for term in re.findall(r"[A-Za-z0-9-]{3,}", subject)
+                ]
+                selected = [
+                    row
+                    for row in rows
+                    if all(
+                        term in (
+                            row["article"].casefold()
+                            + " "
+                            + metadata.get(row["article"], "")
+                        )
+                        for term in subject_terms
+                    )
+                ]
+
+            heading = (
+                f"English Wikipedia Featured Articles promoted in "
+                f"{normalized_month} {year}.\n"
+            )
+            if subject:
+                heading += (
+                    f"Subject filter: {subject}. "
+                    f"Matched {len(selected)} of {len(rows)} rows.\n"
+                )
+            if not selected:
+                compact_rows = "; ".join(
+                    f"{row['article']} — {row['nominator']}" for row in rows
+                )
+                return (
+                    heading
+                    + "No subject match was confirmed from article intros or "
+                    "categories. Unfiltered rows:\n"
+                    + compact_rows
+                )
+            return heading + "\n".join(
+                f"- Article: {row['article']} | Nominator: {row['nominator']}"
+                for row in selected
+            )
+        except Exception as exc:
+            return (
+                "Could not read the Wikipedia featured-article table: "
+                f"{compact_error(exc)}"
+            )
+
+
 class OpenWebPageTool(Tool):
     name = "visit_webpage"
     description = (
@@ -1914,6 +2137,7 @@ class BasicAgent:
             MlbStatsTool(),
             ReadDocumentUrlTool(),
             WikipediaRevisionTool(),
+            WikipediaFeaturedArticlesTool(),
             wikipedia_tool,
             InspectGaiaAttachmentTool(),
             QueryGaiaSpreadsheetTool(),
@@ -1962,6 +2186,8 @@ TOOL ROUTING POLICY:
 6. wikipedia_search is for current Wikipedia or encyclopedic facts.
    wikipedia_revision is mandatory when the task specifies a Wikipedia
    version/year; it preserves historical table rows omitted by summaries.
+   wikipedia_featured_articles is mandatory for Featured Article promotion
+   questions with a month/year; it returns the official article/nominator rows.
    Verify other historical, nomination, or archive details with an exact page.
 
 Research carefully, prefer primary or official sources, and cross-check
@@ -2075,6 +2301,41 @@ include reasoning, explanations, labels, Markdown, citations, or the words
         }
         lower_question = question.lower()
         years = re.findall(r"\b(?:18|19|20)\d{2}\b", question)
+
+        month_match = re.search(
+            r"\b(January|February|March|April|May|June|July|August|"
+            r"September|October|November|December)\b",
+            question,
+            flags=re.I,
+        )
+        featured_subject_match = re.search(
+            r"\babout\s+(?:an?\s+|the\s+)?(.+?)\s+"
+            r"(?:that|which)\s+was\s+promoted\b",
+            question,
+            flags=re.I,
+        )
+        if (
+            not route
+            and "featured article" in lower_question
+            and "promoted" in lower_question
+            and years
+            and month_match
+        ):
+            subject = (
+                featured_subject_match.group(1).strip(" ?.,")
+                if featured_subject_match
+                else ""
+            )
+            self.tools_by_name["wikipedia_featured_articles"].forward(
+                year=int(years[0]),
+                month=month_match.group(1),
+                subject=subject,
+            )
+            route = (
+                "Wikipedia Featured Article promotion -> official monthly "
+                "promotion table"
+            )
+
         matched_team = next(
             (
                 canonical
