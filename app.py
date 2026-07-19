@@ -31,6 +31,7 @@ WEBPAGE_READ_TIMEOUT = 20
 MAX_WEBPAGE_CHARS = 3_500
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_GEMINI_REVIEW_MODEL = DEFAULT_GEMINI_MODEL
+PRACTICALLY_UNLIMITED_STEPS = 2_147_483_647
 GAIA_ROWS_API = "https://datasets-server.huggingface.co/rows"
 TASK_FILE_CACHE = {}
 ATTACHMENT_CACHE = {}
@@ -1653,7 +1654,28 @@ class BasicAgent:
         )
         self.hf_token = hf_token
         self.model_id = model_id
+        configured_max_steps = str(
+            os.getenv("GAIA_MAX_STEPS") or "unlimited"
+        ).strip()
+        if configured_max_steps.lower() in {
+            "",
+            "none",
+            "unlimited",
+            "infinite",
+            "infinity",
+        }:
+            self.max_steps = PRACTICALLY_UNLIMITED_STEPS
+            steps_label = "sem limite prático"
+        else:
+            try:
+                self.max_steps = max(1, int(configured_max_steps))
+            except ValueError:
+                self.max_steps = PRACTICALLY_UNLIMITED_STEPS
+                steps_label = "sem limite prático"
+            else:
+                steps_label = str(self.max_steps)
         print(f"Modelo principal selecionado: {model_id}")
+        print(f"Limite de passos do agente: {steps_label}")
 
         web_search_tool = ConciseWebSearchTool()
         visit_page_tool = OpenWebPageTool()
@@ -1690,7 +1712,7 @@ class BasicAgent:
         self.agent = ToolCallingAgent(
             tools=agent_tools,
             model=self.model,
-            max_steps=6,
+            max_steps=self.max_steps,
             max_tool_threads=1,
             planning_interval=None,
             description=(
@@ -1727,8 +1749,8 @@ repeat its exact tool call. If it directly answers the task, immediately call
 final_answer instead of researching again.
 Do not repeat nearly identical searches. Stop as soon as primary evidence
 answers the exact question. Never pass an entire task as a webpage query; use
-only names, identifiers, and the target fact. Use at most four tool calls, then
-call final_answer with the best supported result.
+only names, identifiers, and the target fact. Continue working until the
+requested value is supported, then call final_answer immediately.
 
 FINAL RESPONSE POLICY:
 Call the final_answer tool with only the requested value. Never write the
@@ -1747,6 +1769,10 @@ include reasoning, explanations, labels, Markdown, citations, or the words
             + "\n\n"
             + self.agent.prompt_templates["system_prompt"]
         )
+
+    def interrupt(self):
+        """Interrompe com segurança a execução atual do smolagents."""
+        self.agent.interrupt()
 
     def _precollect_deterministic_evidence(
         self,
@@ -2130,7 +2156,7 @@ COLLECTED EVIDENCE:
             )
         if invalid_candidate:
             raise RuntimeError(
-                "O agente esgotou as etapas sem produzir uma resposta final. "
+                "O agente não produziu uma resposta final válida. "
                 "A resposta não foi salva; execute novamente esta questão."
             )
         return self.review_answer_with_gemini(

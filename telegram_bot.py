@@ -292,6 +292,11 @@ class TelegramGaiaBot:
                         agent(question, task_id)
                     ).strip()
                 except Exception as exc:
+                    if self.batch_cancel_event.is_set():
+                        return (
+                            f"Execução interrompida: {len(state.answers)}/"
+                            f"{len(questions)} respostas salvas."
+                        )
                     failures.append(f"{task_id}: {exc}")
                 if index % 5 == 0:
                     self.send_message(
@@ -330,6 +335,9 @@ class TelegramGaiaBot:
                     "Não foi possível enviar o resultado do lote: "
                     f"{self._safe_error(exc)}"
                 )
+            finally:
+                if self.batch_cancel_event.is_set():
+                    self.agent = None
 
         self.batch_thread = threading.Thread(
             target=worker,
@@ -533,9 +541,13 @@ class TelegramGaiaBot:
                     result = "Não existe uma execução em andamento."
                 else:
                     self.batch_cancel_event.set()
+                    if self.agent is not None:
+                        interrupt = getattr(self.agent, "interrupt", None)
+                        if callable(interrupt):
+                            interrupt()
                     result = (
-                        "Interrupção solicitada. A execução será encerrada "
-                        "após a questão atual."
+                        "Interrupção solicitada ao agente. O lote será "
+                        "encerrado assim que a chamada atual responder."
                     )
             elif command == "/progresso":
                 result = self._progress_text(chat_id)

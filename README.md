@@ -116,6 +116,12 @@ O agente e a conversa do Telegram utilizam exclusivamente o Gemini. Para trocar
 o modelo Gemini principal, configure `GAIA_GEMINI_MODEL`; para trocar somente o
 modelo da conversa, configure `TELEGRAM_GEMINI_MODEL`.
 
+Por padrão, `GAIA_MAX_STEPS=unlimited`: o agente continua pesquisando até
+produzir uma resposta, receber um erro do provedor ou ser interrompido. Como o
+`smolagents` exige internamente um inteiro, o aplicativo usa um valor
+praticamente inalcançável. Para restaurar uma proteção, configure um número,
+por exemplo `GAIA_MAX_STEPS=30`.
+
 ### Descobrir o `chat_id`
 
 1. Cadastre somente o novo `TELEGRAM_BOT_TOKEN`.
