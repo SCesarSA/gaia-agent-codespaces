@@ -5,6 +5,7 @@ import ast
 import json
 import math
 import operator
+import random
 import threading
 from io import BytesIO
 from pathlib import Path
@@ -30,17 +31,170 @@ WEBPAGE_READ_TIMEOUT = 20
 MAX_WEBPAGE_CHARS = 3_500
 DEFAULT_MAIN_MODEL = "cerebras/zai-glm-4.7"
 DEFAULT_GEMINI_REVIEW_MODEL = "gemini-3.5-flash"
+GAIA_ROWS_API = "https://datasets-server.huggingface.co/rows"
 TASK_FILE_CACHE = {}
 ATTACHMENT_CACHE = {}
 WEBPAGE_CACHE = {}
 SEARCH_CACHE = {}
 SEARCH_LOCK = threading.Lock()
 RUN_STATE = threading.local()
+OFFICIAL_QUESTIONS_CACHE = []
+QUESTIONS_CACHE_LOCK = threading.Lock()
+QUESTIONS_SOURCE = ""
 
 
 def compact_error(exc: Exception) -> str:
     message = str(exc).strip()
     return message or repr(exc)
+
+
+def _direct_gaia_questions() -> list[dict]:
+    """Reproduces the official scoring Space filter through the dataset API."""
+    token = os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "HF_TOKEN é necessário para carregar o dataset GAIA diretamente."
+        )
+
+    rows = []
+    offset = 0
+    total = None
+    while total is None or offset < total:
+        response = requests.get(
+            GAIA_ROWS_API,
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "dataset": "gaia-benchmark/GAIA",
+                "config": "2023_level1",
+                "split": "validation",
+                "offset": offset,
+                "length": 100,
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+        if response.status_code in {401, 403}:
+            raise RuntimeError(
+                "Acesso ao dataset GAIA negado. Aceite as condições em "
+                "https://huggingface.co/datasets/gaia-benchmark/GAIA e "
+                "confirme que HF_TOKEN possui permissão de leitura."
+            )
+        response.raise_for_status()
+        payload = response.json()
+        batch = payload.get("rows") or []
+        total = int(payload.get("num_rows_total") or len(batch))
+        if not batch:
+            break
+        rows.extend(
+            wrapper.get("row", wrapper)
+            for wrapper in batch
+            if isinstance(wrapper, dict)
+        )
+        offset += len(batch)
+
+    questions = []
+    for item in rows:
+        metadata = item.get("Annotator Metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        try:
+            number_of_tools = int(metadata.get("Number of tools"))
+            number_of_steps = int(metadata.get("Number of steps"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if number_of_tools >= 3 or number_of_steps >= 6:
+            continue
+
+        task_id = str(item.get("task_id") or "").strip()
+        question = str(item.get("Question") or "").strip()
+        if not task_id or not question or item.get("Final answer") is None:
+            continue
+        public_item = {
+            "task_id": task_id,
+            "question": question,
+            "Level": item.get("Level"),
+            "file_name": item.get("file_name"),
+        }
+        questions.append(
+            {
+                key: value
+                for key, value in public_item.items()
+                if value is not None
+            }
+        )
+
+    if not questions:
+        raise RuntimeError(
+            "O dataset GAIA foi acessado, mas nenhuma questão correspondeu "
+            "ao filtro oficial (tools < 3 e steps < 6)."
+        )
+    return questions
+
+
+def fetch_official_questions(force_refresh: bool = False) -> list[dict]:
+    """Uses the scoring API first and reconstructs its 20-question set if down."""
+    global OFFICIAL_QUESTIONS_CACHE
+    global QUESTIONS_SOURCE
+
+    with QUESTIONS_CACHE_LOCK:
+        if OFFICIAL_QUESTIONS_CACHE and not force_refresh:
+            return [dict(item) for item in OFFICIAL_QUESTIONS_CACHE]
+
+        errors = []
+        try:
+            response = requests.get(
+                f"{DEFAULT_API_URL}/questions",
+                timeout=HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+            questions = response.json()
+            if not isinstance(questions, list) or not questions:
+                raise ValueError("A API retornou uma lista vazia.")
+            QUESTIONS_SOURCE = "API oficial do exercício"
+        except Exception as exc:
+            errors.append(f"scoring API: {compact_error(exc)}")
+            try:
+                questions = _direct_gaia_questions()
+                QUESTIONS_SOURCE = (
+                    "dataset GAIA direto (fallback da API indisponível)"
+                )
+                print(
+                    "API de pontuação indisponível; questões reconstruídas "
+                    "diretamente do dataset GAIA."
+                )
+            except Exception as fallback_exc:
+                errors.append(
+                    f"dataset fallback: {compact_error(fallback_exc)}"
+                )
+                raise RuntimeError(
+                    "Não foi possível carregar as questões oficiais. "
+                    + " | ".join(errors)
+                ) from fallback_exc
+
+        normalized = []
+        for item in questions:
+            if not isinstance(item, dict):
+                continue
+            task_id = str(item.get("task_id") or "").strip()
+            question = str(
+                item.get("question") or item.get("Question") or ""
+            ).strip()
+            if not task_id or not question:
+                continue
+            normalized_item = dict(item)
+            normalized_item["task_id"] = task_id
+            normalized_item["question"] = question
+            normalized.append(normalized_item)
+            TASK_FILE_CACHE[task_id] = str(
+                normalized_item.get("file_name") or ""
+            ).strip()
+
+        if not normalized:
+            raise RuntimeError("Nenhuma questão oficial válida foi carregada.")
+        OFFICIAL_QUESTIONS_CACHE = normalized
+        return [dict(item) for item in normalized]
 
 
 def reset_run_evidence():
@@ -235,22 +389,25 @@ def download_gaia_attachment(task_id: str) -> tuple[bytes, str]:
         return ATTACHMENT_CACHE[task_id]
 
     course_url = f"{DEFAULT_API_URL}/files/{task_id}"
-    response = requests.get(course_url, timeout=HTTP_TIMEOUT)
-    if response.ok:
-        result = (response.content, filename_from_response(response, task_id))
-        ATTACHMENT_CACHE[task_id] = result
-        return result
-    if response.status_code != 404:
-        response.raise_for_status()
-
-    questions_response = requests.get(
-        f"{DEFAULT_API_URL}/questions", timeout=HTTP_TIMEOUT
-    )
-    questions_response.raise_for_status()
+    try:
+        response = requests.get(course_url, timeout=HTTP_TIMEOUT)
+        if response.ok:
+            result = (
+                response.content,
+                filename_from_response(response, task_id),
+            )
+            ATTACHMENT_CACHE[task_id] = result
+            return result
+        course_error = (
+            f"course file endpoint returned HTTP {response.status_code}"
+        )
+    except Exception as exc:
+        course_error = f"course file endpoint failed: {compact_error(exc)}"
+    questions = fetch_official_questions()
     item = next(
         (
             question
-            for question in questions_response.json()
+            for question in questions
             if str(question.get("task_id")) == task_id
         ),
         None,
@@ -262,7 +419,7 @@ def download_gaia_attachment(task_id: str) -> tuple[bytes, str]:
     token = os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError(
-            "The course file endpoint returned 404 and HF_TOKEN is required "
+            f"{course_error}; HF_TOKEN is required "
             "for the official GAIA dataset fallback."
         )
 
@@ -303,11 +460,7 @@ def get_task_file_name(task_id: str) -> str:
         return TASK_FILE_CACHE[task_id]
 
     try:
-        response = requests.get(
-            f"{DEFAULT_API_URL}/questions", timeout=HTTP_TIMEOUT
-        )
-        response.raise_for_status()
-        for item in response.json():
+        for item in fetch_official_questions():
             item_task_id = str(item.get("task_id", "")).strip()
             TASK_FILE_CACHE[item_task_id] = str(
                 item.get("file_name") or ""
@@ -2413,6 +2566,22 @@ def empty_results() -> pd.DataFrame:
     return pd.DataFrame(columns=RESULT_COLUMNS)
 
 
+def runtime_username(profile: gr.OAuthProfile | None = None) -> str:
+    if profile and getattr(profile, "username", None):
+        return str(profile.username).strip()
+    configured = str(os.getenv("HF_USERNAME") or "").strip()
+    if configured:
+        return configured
+    repository = str(os.getenv("GITHUB_REPOSITORY") or "").strip()
+    if "/" in repository:
+        return repository.split("/", 1)[0].strip()
+    return ""
+
+
+def runtime_has_hf_access(profile: gr.OAuthProfile | None = None) -> bool:
+    return bool(profile or str(os.getenv("HF_TOKEN") or "").strip())
+
+
 def answer_readiness(answer: str) -> tuple[int, str]:
     """Avalia somente se a resposta parece pronta; não verifica o gabarito."""
     text = str(answer or "").strip()
@@ -2482,9 +2651,9 @@ def progress_summary(questions: list, answers: dict) -> str:
 
 def load_evaluation_questions(profile: gr.OAuthProfile | None):
     """Carrega as 20 questões, mas não executa o agente."""
-    if not profile:
+    if not runtime_has_hf_access(profile):
         return (
-            "Faça login no Hugging Face primeiro.",
+            "Faça login no Hugging Face ou configure HF_TOKEN no Codespaces.",
             [],
             {},
             gr.update(choices=[], value=None),
@@ -2497,11 +2666,7 @@ def load_evaluation_questions(profile: gr.OAuthProfile | None):
         )
 
     try:
-        response = requests.get(
-            f"{DEFAULT_API_URL}/questions", timeout=HTTP_TIMEOUT
-        )
-        response.raise_for_status()
-        questions = response.json()
+        questions = fetch_official_questions()
         questions = [
             item
             for item in questions
@@ -2521,7 +2686,8 @@ def load_evaluation_questions(profile: gr.OAuthProfile | None):
         first = questions[0]
         dataframe = review_dataframe(questions, answers)
         return (
-            f"{len(questions)} questões carregadas. Nenhuma foi executada ainda.",
+            f"{len(questions)} questões carregadas via {QUESTIONS_SOURCE}. "
+            "Nenhuma foi executada ainda.",
             questions,
             answers,
             gr.update(choices=choices, value=str(first["task_id"])),
@@ -2638,11 +2804,11 @@ def run_all_evaluation_questions(
     profile: gr.OAuthProfile | None, questions: list, answers: dict
 ):
     """Executa todas as questões carregadas e reúne as respostas para revisão."""
-    if not profile:
+    if not runtime_has_hf_access(profile):
         dataframe = review_dataframe(questions, answers)
         return (
             answers or {},
-            "Faça login no Hugging Face primeiro.",
+            "Faça login no Hugging Face ou configure HF_TOKEN no Codespaces.",
             progress_summary(questions, answers),
             readiness_summary(dataframe),
             dataframe,
@@ -2703,17 +2869,14 @@ def run_all_evaluation_questions(
 def fetch_random_question():
     """Busca somente uma questão oficial aleatória, sem executar ou enviar."""
     try:
-        response = requests.get(
-            f"{DEFAULT_API_URL}/random-question", timeout=HTTP_TIMEOUT
-        )
-        response.raise_for_status()
-        item = response.json()
+        item = random.choice(fetch_official_questions())
         task_id = str(item.get("task_id", "")).strip()
         question = str(item.get("question", "")).strip()
         if not task_id or not question:
             raise ValueError("A API retornou uma pergunta em formato inválido.")
         return (
-            "Uma questão GAIA foi carregada. Clique em 'Testar esta questão'.",
+            f"Uma questão GAIA foi carregada via {QUESTIONS_SOURCE}. "
+            "Clique em 'Testar esta questão'.",
             question,
             task_id,
             "",
@@ -2741,9 +2904,9 @@ def test_agent(question: str, task_id: str):
 
 def run_agent_only(profile: gr.OAuthProfile | None):
     """Busca as perguntas e gera uma tabela editável, sem enviar respostas."""
-    if not profile:
+    if not runtime_has_hf_access(profile):
         return (
-            "Faça login no Hugging Face primeiro.",
+            "Faça login no Hugging Face ou configure HF_TOKEN no Codespaces.",
             empty_results(),
             "Índice de prontidão: 0%.",
         )
@@ -2757,11 +2920,8 @@ def run_agent_only(profile: gr.OAuthProfile | None):
             "Índice de prontidão: 0%.",
         )
 
-    questions_url = f"{DEFAULT_API_URL}/questions"
     try:
-        response = requests.get(questions_url, timeout=30)
-        response.raise_for_status()
-        questions = response.json()
+        questions = fetch_official_questions()
         if not questions:
             return (
                 "A API retornou uma lista de perguntas vazia.",
@@ -2857,8 +3017,12 @@ def submit_to_leaderboard(
     profile: gr.OAuthProfile | None, results_table
 ):
     """Envia exatamente os valores atualmente visíveis na tabela revisada."""
-    if not profile:
-        return "Faça login no Hugging Face primeiro."
+    username = runtime_username(profile)
+    if not username:
+        return (
+            "Envio bloqueado: não foi possível identificar o usuário. "
+            "Faça login no Hugging Face ou configure HF_USERNAME."
+        )
 
     try:
         answers = normalize_results(results_table)
@@ -2868,16 +3032,27 @@ def submit_to_leaderboard(
     if not answers:
         return "Não há respostas para enviar. Execute a avaliação primeiro."
 
-    space_id = os.getenv("SPACE_ID")
-    if not space_id:
+    configured_agent_url = str(os.getenv("AGENT_CODE_URL") or "").strip()
+    space_id = str(os.getenv("SPACE_ID") or "").strip()
+    github_repository = str(os.getenv("GITHUB_REPOSITORY") or "").strip()
+    if configured_agent_url:
+        agent_code_url = configured_agent_url
+    elif space_id:
+        agent_code_url = (
+            f"https://huggingface.co/spaces/{space_id}/tree/main"
+        )
+    elif github_repository:
+        agent_code_url = f"https://github.com/{github_repository}"
+    else:
         return (
-            "Envio bloqueado: a variável SPACE_ID não foi encontrada. "
-            "Publique/execute este app em um Hugging Face Space."
+            "Envio bloqueado: não foi possível determinar a URL do agente. "
+            "Configure AGENT_CODE_URL ou execute dentro de um repositório "
+            "GitHub/Codespaces."
         )
 
     submission = {
-        "username": profile.username.strip(),
-        "agent_code": f"https://huggingface.co/spaces/{space_id}/tree/main",
+        "username": username,
+        "agent_code": agent_code_url,
         "answers": answers,
     }
 
@@ -2901,7 +3076,10 @@ def submit_to_leaderboard(
         detail = ""
         if exc.response is not None:
             detail = f" Resposta da API: {exc.response.text[:500]}"
-        return f"Falha no envio: {exc}.{detail}"
+        return (
+            "Falha no envio para a API oficial. As respostas continuam "
+            f"salvas na tabela desta sessão. Detalhe: {exc}.{detail}"
+        )
     except Exception as exc:
         return f"Erro inesperado no envio: {exc}"
 
